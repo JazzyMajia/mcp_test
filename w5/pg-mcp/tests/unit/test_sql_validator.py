@@ -659,3 +659,85 @@ class TestSubqueryWithForbiddenOperations:
         is_valid, error = validator.validate(sql)
         assert is_valid
         assert error is None
+
+
+class TestWriteOperationPolicy:
+    """Test allow_write_operations wiring in the validator."""
+
+    @pytest.fixture
+    def readonly_validator(self) -> SQLValidator:
+        """Validator with writes disabled (default)."""
+        return SQLValidator(config=SecurityConfig(allow_write_operations=False))
+
+    @pytest.fixture
+    def write_allowed_validator(self) -> SQLValidator:
+        """Validator with writes explicitly enabled."""
+        return SQLValidator(config=SecurityConfig(allow_write_operations=True))
+
+    def test_writes_blocked_by_default(self, readonly_validator: SQLValidator) -> None:
+        """Test write statements are rejected when writes are not allowed."""
+        for sql in (
+            "INSERT INTO users VALUES (1)",
+            "UPDATE users SET name = 'x'",
+            "DELETE FROM users",
+            "MERGE INTO users USING src ON id = id WHEN MATCHED THEN UPDATE SET name = 'x'",
+        ):
+            is_valid, error = readonly_validator.validate(sql)
+            assert not is_valid, sql
+            assert error is not None
+
+    def test_writes_allowed_when_configured(
+        self, write_allowed_validator: SQLValidator
+    ) -> None:
+        """Test write statements pass validation when explicitly allowed."""
+        for sql in (
+            "INSERT INTO users VALUES (1)",
+            "UPDATE users SET name = 'x'",
+            "DELETE FROM users",
+        ):
+            is_valid, error = write_allowed_validator.validate(sql)
+            assert is_valid, f"{sql}: {error}"
+
+    def test_dangerous_functions_still_blocked_when_writes_allowed(
+        self, write_allowed_validator: SQLValidator
+    ) -> None:
+        """Test dangerous functions remain blocked even with writes enabled."""
+        is_valid, error = write_allowed_validator.validate("SELECT pg_sleep(10)")
+        assert not is_valid
+        assert "pg_sleep" in error
+
+    def test_ddl_still_blocked_when_writes_allowed(
+        self, write_allowed_validator: SQLValidator
+    ) -> None:
+        """Test DDL statements remain blocked even with writes enabled."""
+        for sql in (
+            "DROP TABLE users",
+            "CREATE TABLE t (id int)",
+            "ALTER TABLE users DROP COLUMN id",
+        ):
+            is_valid, _ = write_allowed_validator.validate(sql)
+            assert not is_valid, sql
+
+    def test_data_modifying_cte_rejected(self, readonly_validator: SQLValidator) -> None:
+        """Test data-modifying CTEs are rejected in read-only mode."""
+        is_valid, error = readonly_validator.validate(
+            "WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d"
+        )
+        assert not is_valid
+        assert error is not None
+
+    def test_data_modifying_cte_allowed_when_writes_enabled(
+        self, write_allowed_validator: SQLValidator
+    ) -> None:
+        """Test data-modifying CTEs pass validation when writes are enabled."""
+        is_valid, error = write_allowed_validator.validate(
+            "WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d"
+        )
+        assert is_valid, error
+
+    def test_select_with_plain_cte_still_valid(self, readonly_validator: SQLValidator) -> None:
+        """Test ordinary read-only CTEs still pass validation."""
+        is_valid, error = readonly_validator.validate(
+            "WITH active AS (SELECT * FROM users WHERE active) SELECT * FROM active"
+        )
+        assert is_valid, error

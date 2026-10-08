@@ -370,6 +370,70 @@ class TestQueryResponse:
         assert response.generated_sql is not None
         assert response.data is None
 
+    def test_to_dict_stable_shape(self) -> None:
+        """Test to_dict returns all fields with tokens_used always present."""
+        response = QueryResponse(
+            success=True,
+            generated_sql="SELECT * FROM users",
+            confidence=90,
+        )
+        result = response.to_dict()
+        # All model fields are present (None where not applicable)
+        assert set(result) == {
+            "success",
+            "generated_sql",
+            "validation",
+            "data",
+            "error",
+            "confidence",
+            "tokens_used",
+        }
+        assert result["data"] is None
+        assert result["error"] is None
+        assert result["tokens_used"] == 0
+
+    def test_to_dict_error_response_shape(self) -> None:
+        """Test to_dict on an error response keeps the same top-level shape."""
+        from pg_mcp.models.query import ErrorDetail
+
+        response = QueryResponse(
+            success=False,
+            error=ErrorDetail(code="sql_parse_error", message="bad SQL"),
+        )
+        result = response.to_dict()
+        assert result["success"] is False
+        assert result["error"]["code"] == "sql_parse_error"
+        assert result["generated_sql"] is None
+        assert result["tokens_used"] == 0
+        assert set(result) == {
+            "success",
+            "generated_sql",
+            "validation",
+            "data",
+            "error",
+            "confidence",
+            "tokens_used",
+        }
+
+    def test_to_dict_success_with_data(self) -> None:
+        """Test to_dict on a successful response includes serialized data."""
+        response = QueryResponse(
+            success=True,
+            generated_sql="SELECT COUNT(*) FROM users",
+            data=QueryResult(
+                columns=["count"],
+                rows=[{"count": 10}],
+                row_count=1,
+                execution_time_ms=1.5,
+            ),
+            confidence=95,
+            tokens_used=123,
+        )
+        result = response.to_dict()
+        assert result["data"]["row_count"] == 1
+        assert result["data"]["rows"] == [{"count": 10}]
+        assert result["tokens_used"] == 123
+
 
 class TestErrorModels:
     """Tests for error models."""

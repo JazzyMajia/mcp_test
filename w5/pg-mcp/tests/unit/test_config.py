@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from pg_mcp.config.settings import (
     CacheConfig,
     DatabaseConfig,
+    DatabaseSecurityPolicy,
     ObservabilityConfig,
     OpenAIConfig,
     ResilienceConfig,
@@ -200,24 +201,24 @@ class TestValidationConfig:
         """Test default configuration values."""
         config = ValidationConfig()
         assert config.max_question_length == 10000
-        assert config.min_confidence_score == 70
+        assert config.confidence_threshold == 70
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
         config = ValidationConfig(
             max_question_length=5000,
-            min_confidence_score=80,
+            confidence_threshold=80,
         )
         assert config.max_question_length == 5000
-        assert config.min_confidence_score == 80
+        assert config.confidence_threshold == 80
 
-    def test_invalid_confidence_score(self) -> None:
-        """Test invalid confidence score is rejected."""
+    def test_invalid_confidence_threshold(self) -> None:
+        """Test invalid confidence threshold is rejected."""
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=-1)
+            ValidationConfig(confidence_threshold=-1)
 
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=101)
+            ValidationConfig(confidence_threshold=101)
 
 
 class TestCacheConfig:
@@ -261,6 +262,9 @@ class TestResilienceConfig:
         assert config.backoff_factor == 2.0
         assert config.circuit_breaker_threshold == 5
         assert config.circuit_breaker_timeout == 60.0
+        assert config.max_concurrent_queries == 10
+        assert config.max_concurrent_llm_calls == 5
+        assert config.rate_limit_timeout == 5.0
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
@@ -268,10 +272,16 @@ class TestResilienceConfig:
             max_retries=5,
             retry_delay=2.0,
             backoff_factor=3.0,
+            max_concurrent_queries=20,
+            max_concurrent_llm_calls=8,
+            rate_limit_timeout=2.5,
         )
         assert config.max_retries == 5
         assert config.retry_delay == 2.0
         assert config.backoff_factor == 3.0
+        assert config.max_concurrent_queries == 20
+        assert config.max_concurrent_llm_calls == 8
+        assert config.rate_limit_timeout == 2.5
 
     def test_invalid_values(self) -> None:
         """Test invalid values are rejected."""
@@ -280,6 +290,100 @@ class TestResilienceConfig:
 
         with pytest.raises(ValidationError):
             ResilienceConfig(backoff_factor=0.5)
+
+        with pytest.raises(ValidationError):
+            ResilienceConfig(max_concurrent_queries=0)
+
+        with pytest.raises(ValidationError):
+            ResilienceConfig(rate_limit_timeout=0)
+
+
+class TestDatabaseSecurityPolicy:
+    """Tests for DatabaseSecurityPolicy."""
+
+    def test_default_values(self) -> None:
+        """Test default policy allows everything the global config allows."""
+        policy = DatabaseSecurityPolicy()
+        assert policy.blocked_tables == []
+        assert policy.blocked_columns == []
+        assert policy.allow_explain is False
+
+    def test_csv_parsing(self) -> None:
+        """Test comma-separated string parsing for blocked lists."""
+        policy = DatabaseSecurityPolicy(
+            blocked_tables="secrets, audit_log",
+            blocked_columns="password",
+        )
+        assert policy.blocked_tables == ["secrets", "audit_log"]
+        assert policy.blocked_columns == ["password"]
+
+
+class TestSecurityConfigPolicies:
+    """Tests for SecurityConfig per-database policy resolution."""
+
+    def test_default_no_policies(self) -> None:
+        """Test policy_for with no per-database overrides."""
+        config = SecurityConfig()
+        policy = config.policy_for("anydb")
+        assert policy.blocked_tables == []
+        assert policy.blocked_columns == []
+        assert policy.allow_explain is False
+
+    def test_global_lists_apply_to_all_databases(self) -> None:
+        """Test global blocked lists apply to every database."""
+        config = SecurityConfig(blocked_tables="secrets", allow_explain=True)
+        policy = config.policy_for("db1")
+        assert policy.blocked_tables == ["secrets"]
+        assert policy.allow_explain is True
+
+    def test_per_database_policy_is_additive(self) -> None:
+        """Test per-database policy extends the global lists."""
+        config = SecurityConfig(
+            blocked_tables=["secrets"],
+            database_policies={
+                "analytics": DatabaseSecurityPolicy(blocked_tables=["raw_events"]),
+            },
+        )
+        policy = config.policy_for("analytics")
+        assert sorted(policy.blocked_tables) == ["raw_events", "secrets"]
+        # Other databases keep only the global policy
+        assert config.policy_for("otherdb").blocked_tables == ["secrets"]
+
+    def test_per_database_allow_explain_override(self) -> None:
+        """Test per-database allow_explain overrides the global value."""
+        config = SecurityConfig(
+            allow_explain=False,
+            database_policies={
+                "devdb": DatabaseSecurityPolicy(allow_explain=True),
+            },
+        )
+        assert config.policy_for("devdb").allow_explain is True
+        assert config.policy_for("otherdb").allow_explain is False
+
+    def test_database_policies_from_json_string(self) -> None:
+        """Test database_policies parses from a JSON string (env var)."""
+        import json
+
+        raw = json.dumps(
+            {
+                "analytics": {"blocked_tables": ["internal"], "allow_explain": True},
+            }
+        )
+        config = SecurityConfig(database_policies=raw)
+        assert "analytics" in config.database_policies
+        policy = config.policy_for("analytics")
+        assert policy.blocked_tables == ["internal"]
+        assert policy.allow_explain is True
+
+    def test_invalid_database_policies_rejected(self) -> None:
+        """Test invalid database_policies values are rejected."""
+        with pytest.raises(ValidationError):
+            SecurityConfig(database_policies=[{"name": "x"}])
+
+    def test_allow_write_operations_flag(self) -> None:
+        """Test allow_write_operations is a wired config field."""
+        config = SecurityConfig(allow_write_operations=True)
+        assert config.allow_write_operations is True
 
 
 class TestObservabilityConfig:
@@ -292,7 +396,7 @@ class TestObservabilityConfig:
         # 生产环境应该通过环境变量显式设置
         assert config.metrics_port == 9090
         assert config.log_level == "INFO"
-        assert config.log_format == "json"
+        assert config.log_format == "text"
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
@@ -366,6 +470,71 @@ class TestSettings:
         assert settings.database.host == "custom.host"
         assert settings.database.port == 5433
         assert settings.security.allow_write_operations is True
+
+    def test_databases_from_json_list(self) -> None:
+        """Test DATABASES as a JSON array of database configs."""
+        import json
+
+        raw = json.dumps(
+            [
+                {"name": "analytics", "host": "analytics.example.com"},
+                {"name": "billing", "host": "billing.example.com", "port": 5433},
+            ]
+        )
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            databases=raw,
+        )
+        assert set(settings.databases) == {"analytics", "billing"}
+        assert settings.databases["analytics"].host == "analytics.example.com"
+        assert settings.databases["billing"].port == 5433
+
+    def test_databases_from_json_object(self) -> None:
+        """Test DATABASES as a JSON object keyed by database name."""
+        import json
+
+        raw = json.dumps(
+            {
+                "analytics": {"host": "analytics.example.com"},
+                "billing": {"host": "billing.example.com"},
+            }
+        )
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            databases=raw,
+        )
+        assert set(settings.databases) == {"analytics", "billing"}
+        assert settings.databases["analytics"].name == "analytics"
+
+    def test_all_database_configs_merges_primary(self) -> None:
+        """Test all_database_configs merges primary database with extras."""
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            database=DatabaseConfig(name="main", host="main.example.com"),
+            databases=[{"name": "analytics", "host": "analytics.example.com"}],
+        )
+        configs = settings.all_database_configs
+        assert set(configs) == {"main", "analytics"}
+        assert configs["main"].host == "main.example.com"
+        assert configs["analytics"].host == "analytics.example.com"
+
+    def test_all_database_configs_primary_wins_on_conflict(self) -> None:
+        """Test primary database config wins over a same-name DATABASES entry."""
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            database=DatabaseConfig(name="main", host="primary.example.com"),
+            databases=[{"name": "main", "host": "override.example.com"}],
+        )
+        configs = settings.all_database_configs
+        assert configs["main"].host == "primary.example.com"
+
+    def test_empty_database_name_rejected(self) -> None:
+        """Test empty database names in databases are rejected."""
+        with pytest.raises(ValidationError):
+            Settings(
+                openai=OpenAIConfig(api_key="sk-test"),
+                databases={"": {"host": "h"}},
+            )
 
 
 class TestSettingsGlobalInstance:

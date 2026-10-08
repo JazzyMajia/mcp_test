@@ -614,3 +614,43 @@ class TestRowLimiting:
         # Assert
         assert count == 10
         assert len(results) == 10  # All results returned
+
+
+class TestWriteTransactionPolicy:
+    """Test allow_write_operations wiring in the executor transaction mode."""
+
+    @pytest.mark.asyncio
+    async def test_readonly_transaction_by_default(
+        self,
+        mock_pool: MagicMock,
+        mock_connection: MagicMock,
+        db_config: DatabaseConfig,
+    ) -> None:
+        """Test queries run in a read-only transaction when writes are not allowed."""
+        config = SecurityConfig(allow_write_operations=False)
+        executor = SQLExecutor(mock_pool, config, db_config)
+        mock_connection.fetch.return_value = [create_mock_record({"id": 1})]
+
+        await executor.execute("SELECT 1")
+
+        transaction_mock = mock_connection.transaction.call_args
+        assert transaction_mock is not None
+        assert transaction_mock.kwargs.get("readonly") is True
+
+    @pytest.mark.asyncio
+    async def test_writable_transaction_when_allowed(
+        self,
+        mock_pool: MagicMock,
+        mock_connection: MagicMock,
+        db_config: DatabaseConfig,
+    ) -> None:
+        """Test the transaction is writable only when writes are explicitly allowed."""
+        config = SecurityConfig(allow_write_operations=True)
+        executor = SQLExecutor(mock_pool, config, db_config)
+        mock_connection.fetch.return_value = [create_mock_record({"id": 1})]
+
+        await executor.execute("INSERT INTO t VALUES (1)")
+
+        transaction_mock = mock_connection.transaction.call_args
+        assert transaction_mock is not None
+        assert transaction_mock.kwargs.get("readonly") is False

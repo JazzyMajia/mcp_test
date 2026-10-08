@@ -160,6 +160,11 @@ class QueryResponse(BaseModel):
     def to_dict(self) -> dict[str, Any]:
         """Convert response to dictionary for MCP tool return.
 
+        This is the single canonical serialization used by the MCP tool layer:
+        all fields are present (``None`` where not applicable) and
+        ``tokens_used`` defaults to ``0`` instead of ``None`` so clients can
+        rely on a stable response shape.
+
         Returns:
             dict: Dictionary representation compatible with MCP protocol.
         """
@@ -210,11 +215,3 @@ class QueryResponse(BaseModel):
             if not success and v is None:
                 raise ValueError("Error must be present when success is False")
         return v
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert response to dictionary.
-
-        Returns:
-            dict: Dictionary representation of query response.
-        """
-        return self.model_dump(exclude_none=True)

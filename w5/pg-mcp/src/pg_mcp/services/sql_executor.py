@@ -22,7 +22,8 @@ class SQLExecutor:
 
     This executor ensures safe query execution by:
     1. Setting session parameters (timeout, search_path, role)
-    2. Running queries in read-only transactions
+    2. Running queries in read-only transactions (unless write operations
+       are explicitly allowed via the security config)
     3. Limiting the number of returned rows
     4. Serializing PostgreSQL-specific data types
 
@@ -59,7 +60,8 @@ class SQLExecutor:
 
         This method:
         1. Acquires a connection from the pool
-        2. Starts a read-only transaction
+        2. Starts a read-only transaction (writable only if the security config
+           explicitly allows write operations)
         3. Sets session parameters (timeout, search_path, role)
         4. Executes the query with timeout
         5. Limits the number of returned rows
@@ -91,10 +93,13 @@ class SQLExecutor:
         timeout = timeout or self.security_config.max_execution_time
         max_rows = max_rows or self.security_config.max_rows
 
+        # Read-only by default; write transactions only when explicitly allowed
+        readonly = not self.security_config.allow_write_operations
+
         try:
             async with (
                 self.pool.acquire() as connection,
-                connection.transaction(readonly=True),
+                connection.transaction(readonly=readonly),
             ):
                 # Set session parameters for security
                 await self._set_session_params(connection, timeout)

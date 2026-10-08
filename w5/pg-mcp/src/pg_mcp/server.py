@@ -3,6 +3,14 @@
 This module implements the MCP server using FastMCP, exposing the query
 functionality as an MCP tool. It includes complete lifespan management for
 initializing and cleaning up all components.
+
+Multi-database support:
+    All databases configured in :class:`Settings` (the primary ``DATABASE_*``
+    environment variables plus any ``DATABASES`` JSON entries) get their own
+    connection pool, schema cache entry, SQL validator, and SQL executor.
+    Validators enforce per-database security policies (blocked tables/columns
+    and EXPLAIN policy), so requests are always routed to the executor that
+    matches the requested database.
 """
 
 from collections.abc import AsyncIterator
@@ -14,7 +22,7 @@ from mcp.server.fastmcp import FastMCP
 
 from pg_mcp.cache.schema_cache import SchemaCache
 from pg_mcp.config.settings import Settings
-from pg_mcp.db.pool import close_pools, create_pool
+from pg_mcp.db.pool import close_pools, create_pools
 from pg_mcp.models.query import QueryRequest, QueryResponse, ReturnType
 from pg_mcp.observability.logging import configure_logging, get_logger
 from pg_mcp.observability.metrics import MetricsCollector
@@ -39,7 +47,7 @@ _rate_limiter: MultiRateLimiter | None = None
 
 
 @asynccontextmanager
-async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-arg]
+async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
     """Lifespan context manager for server initialization and cleanup.
 
     This function manages the complete lifecycle of the MCP server:
@@ -47,13 +55,12 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
     Startup:
         1. Load configuration from Settings
         2. Configure logging
-        3. Create database connection pools
+        3. Create database connection pools for all configured databases
         4. Load schema cache for all databases
-        5. Initialize metrics collector
-        6. Create service components (generators, validators, executors)
+        5. Initialize metrics collector (and HTTP server if enabled)
+        6. Create service components (generator, per-db validators/executors)
         7. Initialize resilience components (circuit breaker, rate limiter)
         8. Create query orchestrator
-        9. Start metrics HTTP server (optional)
 
     Shutdown:
         1. Stop schema auto-refresh (if enabled)
@@ -94,21 +101,21 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             },
         )
 
-        # 3. Create database connection pools
+        # 3. Create database connection pools for ALL configured databases
         logger.info("Creating database connection pools...")
-        _pools = {}
-        # Note: For single database configuration, we use the main database config
-        pool = await create_pool(_settings.database)
-        _pools[_settings.database.name] = pool
-        logger.info(
-            f"Created connection pool for database '{_settings.database.name}'",
-            extra={
-                "min_size": _settings.database.min_pool_size,
-                "max_size": _settings.database.max_pool_size,
-            },
-        )
+        db_configs = _settings.all_database_configs
+        _pools = await create_pools(list(db_configs.values()))
+        for db_name, db_config in db_configs.items():
+            logger.info(
+                f"Created connection pool for database '{db_name}'",
+                extra={
+                    "host": db_config.host,
+                    "min_size": db_config.min_pool_size,
+                    "max_size": db_config.max_pool_size,
+                },
+            )
 
-        # 4. Load Schema cache
+        # 4. Load Schema cache for all databases
         logger.info("Initializing schema cache...")
         _schema_cache = SchemaCache(_settings.cache)
 
@@ -149,21 +156,33 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # SQL Generator
         sql_generator = SQLGenerator(_settings.openai)
 
-        # SQL Validator
-        sql_validator = SQLValidator(
-            config=_settings.security,
-            blocked_tables=None,  # Can be configured via settings if needed
-            blocked_columns=None,  # Can be configured via settings if needed
-            allow_explain=False,
-        )
+        # SQL Validators (one per database, enforcing per-database policies)
+        security = _settings.security
+        sql_validators: dict[str, SQLValidator] = {}
+        for db_name in _pools:
+            policy = security.policy_for(db_name)
+            sql_validators[db_name] = SQLValidator(
+                config=security,
+                blocked_tables=policy.blocked_tables,
+                blocked_columns=policy.blocked_columns,
+                allow_explain=policy.allow_explain,
+            )
+            logger.info(
+                f"Created SQL validator for database '{db_name}'",
+                extra={
+                    "blocked_tables": policy.blocked_tables,
+                    "blocked_columns": policy.blocked_columns,
+                    "allow_explain": policy.allow_explain,
+                },
+            )
 
-        # SQL Executor (create one per database)
+        # SQL Executors (one per database, each bound to its own pool)
         sql_executors: dict[str, SQLExecutor] = {}
         for db_name, pool in _pools.items():
             executor = SQLExecutor(
                 pool=pool,
-                security_config=_settings.security,
-                db_config=_settings.database,
+                security_config=security,
+                db_config=db_configs[db_name],
             )
             sql_executors[db_name] = executor
             logger.info(f"Created SQL executor for database '{db_name}'")
@@ -183,23 +202,27 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             recovery_timeout=_settings.resilience.circuit_breaker_timeout,
         )
 
-        # Rate Limiter
+        # Rate Limiter, driven by configuration instead of hardcoded values
         _rate_limiter = MultiRateLimiter(
-            query_limit=10,  # Can be made configurable
-            llm_limit=5,  # Can be made configurable
+            query_limit=_settings.resilience.max_concurrent_queries,
+            llm_limit=_settings.resilience.max_concurrent_llm_calls,
         )
 
-        # 8. Create QueryOrchestrator
+        # 8. Create QueryOrchestrator with per-database components
         logger.info("Creating query orchestrator...")
         _orchestrator = QueryOrchestrator(
             sql_generator=sql_generator,
-            sql_validator=sql_validator,
-            sql_executor=sql_executors[_settings.database.name],  # Use primary executor
+            sql_validator=sql_validators[_settings.database.name],
+            sql_executor=sql_executors[_settings.database.name],
             result_validator=result_validator,
             schema_cache=_schema_cache,
             pools=_pools,
             resilience_config=_settings.resilience,
             validation_config=_settings.validation,
+            sql_validators=sql_validators,
+            sql_executors=sql_executors,
+            rate_limiter=_rate_limiter,
+            metrics=_metrics,
         )
 
         logger.info("PostgreSQL MCP Server initialization complete!")
@@ -228,7 +251,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
                     timeout=3.0
                 )
                 logger.info("Schema auto-refresh stopped")
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Schema auto-refresh stop timed out")
             except Exception as e:
                 logger.warning(f"Error stopping schema auto-refresh: {e!s}")
@@ -308,9 +331,12 @@ async def query(
     Security:
         - Only SELECT queries are allowed (no INSERT, UPDATE, DELETE, DROP, etc.)
         - Dangerous PostgreSQL functions are blocked (pg_sleep, file operations, etc.)
+        - Per-database access policies: blocked tables/columns and EXPLAIN policy
+          are enforced via SECURITY_* and SECURITY_DATABASE_POLICIES settings
         - Query execution timeout is enforced
         - Row count limits prevent memory exhaustion
-        - All queries run in read-only transactions
+        - All queries run in read-only transactions (unless writes are explicitly
+          enabled via SECURITY_ALLOW_WRITE_OPERATIONS)
     """
     global _orchestrator
 
@@ -355,11 +381,8 @@ async def query(
     # Execute query through orchestrator
     try:
         response: QueryResponse = await _orchestrator.execute_query(request)
-        result = response.to_dict()
-        # Ensure tokens_used is always present
-        if "tokens_used" not in result:
-            result["tokens_used"] = 0
-        return result
+        # to_dict guarantees a stable shape with tokens_used always present
+        return response.to_dict()
     except Exception as e:
         logger.exception("Unexpected error in query tool")
         return {

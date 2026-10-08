@@ -107,8 +107,23 @@ class SchemaCache:
         if self.config.enabled:
             self._cache[database_name] = schema
             self._cache_timestamps[database_name] = datetime.now(UTC)
+            self._evict_if_full()
 
         return schema
+
+    def _evict_if_full(self) -> None:
+        """Evict the oldest cache entries when the cache exceeds max_size.
+
+        Uses the cache timestamps to evict least-recently-loaded entries,
+        honoring the ``max_size`` limit from the cache configuration.
+        """
+        while len(self._cache) > self.config.max_size:
+            oldest = min(self._cache_timestamps, key=lambda name: self._cache_timestamps[name])
+            logger.debug(
+                "Schema cache full, evicting oldest entry: %s",
+                oldest,
+            )
+            self.clear(oldest)
 
     async def refresh(
         self,

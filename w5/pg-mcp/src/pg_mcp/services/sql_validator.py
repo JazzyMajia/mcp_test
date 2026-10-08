@@ -74,6 +74,14 @@ class SQLValidator:
         "copy_to",
     }
 
+    # Write statement types, only allowed when config.allow_write_operations is set
+    WRITE_STATEMENT_TYPES: ClassVar = {
+        exp.Insert,
+        exp.Update,
+        exp.Delete,
+        exp.Merge,
+    }
+
     def __init__(
         self,
         config: SecurityConfig,
@@ -98,6 +106,18 @@ class SQLValidator:
         self.blocked_functions = self.BUILTIN_DANGEROUS_FUNCTIONS | {
             f.lower() for f in config.blocked_functions
         }
+
+        # Effective statement policies: write statements are only permitted when
+        # explicitly enabled via config.allow_write_operations. Subqueries always
+        # remain read-only regardless of this setting.
+        if config.allow_write_operations:
+            self.allowed_statement_types = self.ALLOWED_STATEMENT_TYPES | self.WRITE_STATEMENT_TYPES
+            self.forbidden_statement_types = (
+                self.FORBIDDEN_STATEMENT_TYPES - self.WRITE_STATEMENT_TYPES
+            )
+        else:
+            self.allowed_statement_types = set(self.ALLOWED_STATEMENT_TYPES)
+            self.forbidden_statement_types = set(self.FORBIDDEN_STATEMENT_TYPES)
 
     def validate(self, sql: str) -> tuple[bool, str | None]:
         """Validate SQL query for security compliance.
@@ -193,6 +213,9 @@ class SQLValidator:
         if error := self._check_subquery_safety(statement):
             raise SecurityViolationError(error)
 
+        if error := self._check_nested_statements(statement):
+            raise SecurityViolationError(error)
+
     def _check_statement_type(self, statement: exp.Expression) -> str | None:
         """Check if statement type is allowed.
 
@@ -203,13 +226,13 @@ class SQLValidator:
             Error message if check fails, None otherwise.
         """
         # Check for forbidden statement types
-        for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
+        for forbidden_type in self.forbidden_statement_types:
             if isinstance(statement, forbidden_type):
                 stmt_name = forbidden_type.__name__.upper()
                 return f"{stmt_name} statements are not allowed. Only SELECT queries are permitted."
 
         # Ensure statement is an allowed type (SELECT or set operations)
-        if not isinstance(statement, tuple(self.ALLOWED_STATEMENT_TYPES)):
+        if not isinstance(statement, tuple(self.allowed_statement_types)):
             stmt_type = type(statement).__name__
             return f"Statement type {stmt_type} is not allowed. Only SELECT queries are permitted."
 
@@ -305,6 +328,33 @@ class SQLValidator:
                 # Ensure it's a SELECT
                 if not isinstance(inner_stmt, (exp.Select, exp.With)):
                     return "Subqueries must contain only SELECT statements"
+
+        return None
+
+    def _check_nested_statements(self, statement: exp.Expression) -> str | None:
+        """Reject write statements nested in CTEs or subqueries when writes are disabled.
+
+        Data-modifying CTEs (e.g. ``WITH d AS (DELETE FROM t RETURNING *)
+        SELECT * FROM d``) hide write operations inside an otherwise
+        read-only-looking query, so the full statement tree is scanned.
+
+        Args:
+            statement: Parsed SQL statement.
+
+        Returns:
+            Error message if check fails, None otherwise.
+        """
+        if self.config.allow_write_operations:
+            return None
+
+        for node in statement.walk():
+            for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
+                if isinstance(node, forbidden_type):
+                    stmt_name = forbidden_type.__name__.upper()
+                    return (
+                        f"{stmt_name} statements are not allowed in CTEs or subqueries. "
+                        "Only SELECT queries are permitted."
+                    )
 
         return None
 

@@ -356,3 +356,57 @@ class TestSchemaCache:
             await cache.stop_auto_refresh()
 
             assert cache._stop_refresh is True
+
+
+class TestCacheMaxSize:
+    """Test max_size enforcement in the schema cache."""
+
+    @pytest.mark.asyncio
+    async def test_cache_evicts_oldest_when_full(self):
+        """Test loading more schemas than max_size evicts the oldest entry."""
+        config = CacheConfig(schema_ttl=3600, max_size=2, enabled=True)
+        cache = SchemaCache(config)
+        mock_pool = Mock()
+
+        schemas = {}
+        for db_name in ("db1", "db2", "db3"):
+            schema = DatabaseSchema(
+                database_name=db_name,
+                tables=[],
+                version="PostgreSQL 16.0",
+            )
+            schemas[db_name] = schema
+            # Space out timestamps so eviction order is deterministic
+            with patch("pg_mcp.cache.schema_cache.SchemaIntrospector") as mock_cls:
+                mock_introspector = AsyncMock()
+                mock_introspector.introspect.return_value = schema
+                mock_cls.return_value = mock_introspector
+                await cache.load(db_name, mock_pool)
+                cache._cache_timestamps[db_name] = datetime.now(UTC) - timedelta(
+                    seconds={"db1": 200, "db2": 100, "db3": 0}[db_name]
+                )
+
+        assert cache.get("db3") == schemas["db3"]
+        assert cache.get("db2") == schemas["db2"]
+        # db1 is the oldest and must have been evicted
+        assert cache.get("db1") is None
+        assert len(cache._cache) == 2
+
+    @pytest.mark.asyncio
+    async def test_cache_within_max_size_keeps_all(self):
+        """Test no eviction happens while the cache is within max_size."""
+        config = CacheConfig(schema_ttl=3600, max_size=5, enabled=True)
+        cache = SchemaCache(config)
+        mock_pool = Mock()
+
+        with patch("pg_mcp.cache.schema_cache.SchemaIntrospector") as mock_cls:
+            mock_introspector = AsyncMock()
+            mock_introspector.introspect.return_value = DatabaseSchema(
+                database_name="db", tables=[], version="16.0"
+            )
+            mock_cls.return_value = mock_introspector
+            for db_name in ("db1", "db2", "db3"):
+                await cache.load(db_name, mock_pool)
+
+        assert len(cache._cache) == 3
+        assert cache.get_cached_databases() == ["db1", "db2", "db3"]
